@@ -236,6 +236,29 @@ impl RequestForwarder {
             && super::media_sanitizer::is_unsupported_image_error(error)
     }
 
+    fn responses_portability_retry_should_trigger(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+        endpoint: &str,
+        already_retried: bool,
+        error: &ProxyError,
+    ) -> bool {
+        matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !already_retried
+            && !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+            && !super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+            && match error {
+                ProxyError::UpstreamError { status, body } => {
+                    super::providers::transform_codex_responses_portability::is_cross_provider_responses_portability_error(
+                        *status,
+                        body.as_deref(),
+                    )
+                }
+                _ => false,
+            }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<ProviderRouter>,
@@ -467,6 +490,7 @@ impl RequestForwarder {
             let mut rectifier_retried = false;
             let mut budget_rectifier_retried = false;
             let mut media_rectifier_retried = false;
+            let mut responses_portability_retried = false;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -704,6 +728,115 @@ impl RequestForwarder {
                                             app_type_str,
                                             used_half_open_permit,
                                             "media 降级",
+                                            &mut last_error,
+                                            &mut last_provider,
+                                        )
+                                        .await
+                                    {
+                                        return Err(err);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if self.responses_portability_retry_should_trigger(
+                        app_type,
+                        provider,
+                        endpoint,
+                        responses_portability_retried,
+                        &e,
+                    ) {
+                        let mut portable_body = provider_body.clone();
+                        if super::providers::transform_codex_responses_portability::sanitize_cross_provider_responses_request(
+                            &mut portable_body,
+                        ) {
+                            let _ = std::mem::replace(&mut responses_portability_retried, true);
+                            log::info!(
+                                "[{app_type_str}] [Responses Portability] Upstream rejected provider-private state; retrying provider={} once with a sanitized in-memory request",
+                                provider.id
+                            );
+
+                            match self
+                                .forward(
+                                    app_type,
+                                    &method,
+                                    provider,
+                                    endpoint,
+                                    &portable_body,
+                                    &headers,
+                                    &extensions,
+                                    adapter.as_ref(),
+                                )
+                                .await
+                            {
+                                Ok((response, claude_api_format, outbound_model)) => {
+                                    log::info!(
+                                        "[{app_type_str}] [Responses Portability] Sanitized retry succeeded"
+                                    );
+                                    self.record_success_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+
+                                    {
+                                        let mut current_providers =
+                                            self.current_providers.write().await;
+                                        current_providers.insert(
+                                            app_type_str.to_string(),
+                                            (provider.id.clone(), provider.name.clone()),
+                                        );
+                                    }
+
+                                    {
+                                        let mut status = self.status.write().await;
+                                        status.success_requests += 1;
+                                        status.last_error = None;
+                                        let should_switch =
+                                            self.current_provider_id_at_start.as_str()
+                                                != provider.id.as_str();
+                                        if should_switch {
+                                            status.failover_count += 1;
+                                            let fm = self.failover_manager.clone();
+                                            let ah = self.app_handle.clone();
+                                            let pid = provider.id.clone();
+                                            let pname = provider.name.clone();
+                                            let at = app_type_str.to_string();
+                                            tokio::spawn(async move {
+                                                let _ = fm
+                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                    .await;
+                                            });
+                                        }
+                                        if status.total_requests > 0 {
+                                            status.success_rate = (status.success_requests as f32
+                                                / status.total_requests as f32)
+                                                * 100.0;
+                                        }
+                                    }
+
+                                    return Ok(ForwardResult {
+                                        response,
+                                        provider: provider.clone(),
+                                        claude_api_format,
+                                        outbound_model,
+                                        connection_guard: None,
+                                    });
+                                }
+                                Err(retry_err) => {
+                                    log::warn!(
+                                        "[{app_type_str}] [Responses Portability] Sanitized retry still failed: {retry_err}"
+                                    );
+                                    if let Some(err) = self
+                                        .handle_rectifier_retry_failure(
+                                            retry_err,
+                                            provider,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                            "Responses portability",
                                             &mut last_error,
                                             &mut last_provider,
                                         )
@@ -5344,6 +5477,66 @@ mod tests {
             ),
         }
     }
+
+    #[test]
+    fn codex_responses_portability_retry_is_scoped_to_native_responses_routes() {
+        let fwd = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let mut native = test_provider_with_type(None);
+        native.settings_config = json!({});
+        let mut chat = test_provider_with_type(None);
+        chat.settings_config = json!({ "api_format": "openai_chat" });
+        let mut anthropic = test_provider_with_type(None);
+        anthropic.settings_config = json!({ "api_format": "anthropic" });
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"Invalid 'input[6].id': 'resp_abc'. Expected an ID that begins with 'msg'."}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(fwd.responses_portability_retry_should_trigger(
+            &AppType::Codex,
+            &native,
+            "/v1/responses",
+            false,
+            &error,
+        ));
+        assert!(!fwd.responses_portability_retry_should_trigger(
+            &AppType::Codex,
+            &chat,
+            "/v1/responses",
+            false,
+            &error,
+        ));
+        assert!(!fwd.responses_portability_retry_should_trigger(
+            &AppType::Codex,
+            &anthropic,
+            "/v1/responses",
+            false,
+            &error,
+        ));
+        assert!(!fwd.responses_portability_retry_should_trigger(
+            &AppType::Codex,
+            &native,
+            "/v1/responses",
+            true,
+            &error,
+        ));
+
+        let unrelated = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(r#"{"error":{"message":"invalid api key"}}"#.to_string()),
+        };
+        assert!(!fwd.responses_portability_retry_should_trigger(
+            &AppType::Codex,
+            &native,
+            "/v1/responses",
+            false,
+            &unrelated,
+        ));
+    }
+
     #[test]
     fn prevention_replaces_when_all_switches_on_and_model_in_heuristic_list() {
         let fwd = forwarder_with_rectifier(RectifierConfig::default());
